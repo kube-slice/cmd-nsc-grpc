@@ -7,8 +7,10 @@ import (
 	"github.com/vishvananda/netns"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -39,20 +41,50 @@ func getInodeURL() (string, error) {
 	inodeURL := fmt.Sprintf("inode://4/%d", inode)
 	return inodeURL, nil
 }
+func hasNSMInterface() bool {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return false
+	}
+
+	for _, iface := range ifaces {
+		if strings.HasPrefix(iface.Name, "nsm") {
+			return true
+		}
+	}
+	return false
+}
+func checkNsmIpPresent(ctx context.Context, cancel context.CancelFunc) {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if !hasNSMInterface() {
+				fmt.Println("nsm interface not present need to reconnect")
+				cancel()
+				return
+			}
+		}
+	}
+}
 func main() {
 	serverAddr := "cmd-nsc-grpc-server.kubeslice-system.svc.cluster.local:50052"
 	fmt.Printf("NETNS_SERVER_ADDR=%s\n", serverAddr)
-	signalCtx, cancelSignalCtx := signal.NotifyContext(
-		context.Background(),
-		os.Interrupt,
-		syscall.SIGHUP,
-		syscall.SIGTERM,
-		syscall.SIGQUIT,
-	)
-	defer cancelSignalCtx()
 	var conn *grpc.ClientConn
 	var err error
 	for {
+		signalCtx, cancelSignalCtx := signal.NotifyContext(
+			context.Background(),
+			os.Interrupt,
+			syscall.SIGHUP,
+			syscall.SIGTERM,
+			syscall.SIGQUIT,
+		)
+		defer cancelSignalCtx()
 		// Retry loop until connection succeeds
 		for {
 			conn, err = grpc.NewClient(serverAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -77,6 +109,7 @@ func main() {
 			fmt.Println("failed to get inode URL")
 			continue
 		}
+		go checkNsmIpPresent(signalCtx, cancelSignalCtx)
 		_, err = client.ProcessPod(signalCtx, &nscpb.PodRequest{
 			Name:           podName,
 			Namespace:      podNamespace,
@@ -84,16 +117,12 @@ func main() {
 			NetworkService: networkService,
 			InodeURL:       inodeUrl,
 		})
-		if err != nil {
-			select {
-			case <-signalCtx.Done():
-				fmt.Println("Exiting...")
-				break
-			default:
-				fmt.Printf("failed to process pod (%v), retrying...\n", err)
-				continue
-			}
+		select {
+		case <-signalCtx.Done():
+			fmt.Println("One request completed waiting 1 minute")
+			time.Sleep(1 * time.Minute)
+		default:
+			continue
 		}
-		break
 	}
 }
