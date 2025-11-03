@@ -76,6 +76,7 @@ func main() {
 	fmt.Printf("NETNS_SERVER_ADDR=%s\n", serverAddr)
 	var conn *grpc.ClientConn
 	var err error
+	retry := 0
 	for {
 		signalCtx, cancelSignalCtx := signal.NotifyContext(
 			context.Background(),
@@ -89,11 +90,10 @@ func main() {
 		for {
 			conn, err = grpc.NewClient(serverAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 			if err != nil {
-				fmt.Printf("failed to connect to gRPC server (%v), retrying in 2s...\n", err)
+				fmt.Printf("failed to connect to gRPC server (%v), retrying in 1s...\n", err)
 				time.Sleep(1 * time.Second)
 				continue
 			}
-			fmt.Println("Connected to gRPC server!")
 			break
 		}
 		defer conn.Close()
@@ -116,13 +116,16 @@ func main() {
 			NodeName:       nodeName,
 			NetworkService: networkService,
 			InodeURL:       inodeUrl,
+			RetryCount:     int32(retry),
 		})
 		select {
 		case <-signalCtx.Done():
 			fmt.Println("One request completed waiting 1 minute")
 			time.Sleep(1 * time.Minute)
 		default:
+			time.Sleep(1 * time.Second)
 			continue
 		}
+		retry++
 	}
 }
