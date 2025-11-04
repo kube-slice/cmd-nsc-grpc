@@ -71,11 +71,26 @@ func checkNsmIpPresent(ctx context.Context, cancel context.CancelFunc) {
 		}
 	}
 }
-func main() {
-	serverAddr := "cmd-nsc-grpc-server.kubeslice-system.svc.cluster.local:50052"
-	fmt.Printf("NETNS_SERVER_ADDR=%s\n", serverAddr)
+func getConnection(serverAddr string) (*grpc.ClientConn, error) {
 	var conn *grpc.ClientConn
 	var err error
+	for {
+		conn, err = grpc.NewClient(serverAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			fmt.Printf("failed to connect to gRPC server (%v), retrying in 1s...\n", err)
+			time.Sleep(1 * time.Second)
+			continue
+		}
+		break
+	}
+	return conn, nil
+}
+func main() {
+	serverAddr := "cmd-nsc-grpc-server.kubeslice-system.svc.cluster.local:50052"
+	if os.Getenv("NSC_GRPC_SERVER_ADDR") != "" {
+		serverAddr = os.Getenv("NSC_GRPC_SERVER_ADDR")
+	}
+	fmt.Printf("NETNS_SERVER_ADDR=%s\n", serverAddr)
 	retry := 0
 	for {
 		signalCtx, cancelSignalCtx := signal.NotifyContext(
@@ -87,19 +102,11 @@ func main() {
 		)
 		defer cancelSignalCtx()
 		// Retry loop until connection succeeds
-		for {
-			conn, err = grpc.NewClient(serverAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-			if err != nil {
-				fmt.Printf("failed to connect to gRPC server (%v), retrying in 1s...\n", err)
-				time.Sleep(1 * time.Second)
-				continue
-			}
-			break
+		conn, err := getConnection(serverAddr)
+		if err != nil {
+			return
 		}
-		defer conn.Close()
-
 		client := nscpb.NewNSCServiceClient(conn)
-
 		podName := os.Getenv("POD_NAME")
 		podNamespace := os.Getenv("MY_POD_NAMESPACE")
 		nodeName := os.Getenv("MY_NODE_NAME")
@@ -107,8 +114,25 @@ func main() {
 		inodeUrl, err := getInodeURL()
 		if err != nil || inodeUrl == "" {
 			fmt.Println("failed to get inode URL")
+			cancelSignalCtx()
 			continue
 		}
+		resp, err := client.DiscoverServer(signalCtx, &nscpb.ClientNode{
+			NodeName: nodeName,
+		})
+		conn.Close()
+		if err != nil || resp.Server_Ip == "" {
+			fmt.Printf("failed to discover server: %v\n", err)
+			continue
+		}
+		fmt.Printf("discovered server: %s\n", resp.Server_Ip)
+		conn, err = getConnection(resp.Server_Ip)
+		defer conn.Close()
+		if err != nil {
+			fmt.Printf("failed to get connection: %v\n", err)
+			continue
+		}
+		client = nscpb.NewNSCServiceClient(conn)
 		go checkNsmIpPresent(signalCtx, cancelSignalCtx)
 		_, err = client.ProcessPod(signalCtx, &nscpb.PodRequest{
 			Name:           podName,
@@ -124,6 +148,7 @@ func main() {
 			time.Sleep(1 * time.Minute)
 		default:
 			time.Sleep(1 * time.Second)
+			cancelSignalCtx()
 			continue
 		}
 		retry++
