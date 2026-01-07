@@ -41,6 +41,7 @@ func getInodeURL() (string, error) {
 	inodeURL := fmt.Sprintf("inode://4/%d", inode)
 	return inodeURL, nil
 }
+
 func hasNSMInterface() bool {
 	ifaces, err := net.Interfaces()
 	if err != nil {
@@ -54,6 +55,7 @@ func hasNSMInterface() bool {
 	}
 	return false
 }
+
 func checkNsmIpPresent(ctx context.Context, cancel context.CancelFunc) {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
@@ -71,6 +73,7 @@ func checkNsmIpPresent(ctx context.Context, cancel context.CancelFunc) {
 		}
 	}
 }
+
 func getConnection(serverAddr string) (*grpc.ClientConn, error) {
 	var conn *grpc.ClientConn
 	var err error
@@ -85,6 +88,7 @@ func getConnection(serverAddr string) (*grpc.ClientConn, error) {
 	}
 	return conn, nil
 }
+
 func main() {
 	serverAddr := "cmd-nsc-grpc-server.kubeslice-system.svc.cluster.local:50052"
 	if os.Getenv("NSC_GRPC_SERVER_ADDR") != "" {

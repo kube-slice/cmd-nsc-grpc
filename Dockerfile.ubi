@@ -10,7 +10,11 @@ WORKDIR /build
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -mod=vendor -a -o /bin/app .
 
-FROM alpine as runtime
+FROM registry.access.redhat.com/ubi10/ubi-minimal as runtime
+
+RUN mkdir -p /licenses
+COPY LICENSE /licenses/
+
 COPY --from=build /bin/app /bin/app
 
 USER 65534
