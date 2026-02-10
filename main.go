@@ -96,6 +96,17 @@ func main() {
 	}
 	fmt.Printf("NETNS_SERVER_ADDR=%s\n", serverAddr)
 	retry := 0
+
+	parentCtx, cancelParentSignalCtx := signal.NotifyContext(
+		context.Background(),
+		os.Interrupt,
+		syscall.SIGHUP,
+		syscall.SIGTERM,
+		syscall.SIGQUIT,
+	)
+
+	defer cancelParentSignalCtx()
+
 	for {
 		signalCtx, cancelSignalCtx := signal.NotifyContext(
 			context.Background(),
@@ -147,6 +158,11 @@ func main() {
 			RetryCount:     int32(retry),
 		})
 		select {
+		case <-parentCtx.Done():
+			fmt.Println("Received termination signal, exiting...")
+			cancelSignalCtx()
+			time.Sleep(30 * time.Second)
+			return
 		case <-signalCtx.Done():
 			fmt.Println("One request completed waiting 1 minute")
 			time.Sleep(1 * time.Minute)
