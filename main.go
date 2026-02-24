@@ -15,6 +15,8 @@ import (
 	"time"
 )
 
+const retryLimit = 100
+
 func getInodeURL() (string, error) {
 	podNS, err := netns.Get()
 	if err != nil {
@@ -107,14 +109,8 @@ func main() {
 
 	defer cancelParentSignalCtx()
 
-	for {
-		signalCtx, cancelSignalCtx := signal.NotifyContext(
-			context.Background(),
-			os.Interrupt,
-			syscall.SIGHUP,
-			syscall.SIGTERM,
-			syscall.SIGQUIT,
-		)
+	for retry < retryLimit {
+		signalCtx, cancelSignalCtx := context.WithCancel(parentCtx)
 		defer cancelSignalCtx()
 		// Retry loop until connection succeeds
 		conn, err := getConnection(serverAddr)
@@ -159,18 +155,24 @@ func main() {
 		})
 		select {
 		case <-parentCtx.Done():
-			fmt.Println("Received termination signal, exiting...")
+			fmt.Println("Parent cancelled, exiting...")
 			cancelSignalCtx()
-			time.Sleep(30 * time.Second)
 			return
+
 		case <-signalCtx.Done():
-			fmt.Println("One request completed waiting 1 minute")
-			time.Sleep(1 * time.Minute)
-		default:
-			time.Sleep(1 * time.Second)
-			cancelSignalCtx()
-			continue
+			fmt.Println("Signal done, waiting 1 minute (unless parent cancels)...")
+
+			for timer := 1; timer <= 60; timer++ {
+				select {
+				case <-parentCtx.Done():
+					fmt.Println("Parent cancelled, exiting...")
+					return
+				default:
+					time.Sleep(1 * time.Second)
+				}
+			}
 		}
+		cancelSignalCtx()
 		retry++
 	}
 }
