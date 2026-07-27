@@ -15,8 +15,6 @@ import (
 	"time"
 )
 
-const retryLimit = 100
-
 func getInodeURL() (string, error) {
 	podNS, err := netns.Get()
 	if err != nil {
@@ -122,27 +120,32 @@ func getConnection(serverAddr string) (*grpc.ClientConn, error) {
 	return conn, nil
 }
 
+// reconnectDelay paces reconnect attempts. The pod is cut off from the slice until the next
+// attempt succeeds, so this is deliberately short.
+const reconnectDelay = time.Second
+
 func main() {
 	serverAddr := "cmd-nsc-grpc-server.kubeslice-system.svc.cluster.local:50052"
 	if os.Getenv("NSC_GRPC_SERVER_ADDR") != "" {
 		serverAddr = os.Getenv("NSC_GRPC_SERVER_ADDR")
 	}
 	fmt.Printf("NETNS_SERVER_ADDR=%s\n", serverAddr)
-	retry := 0
 
-	parentCtx, cancelParentSignalCtx := signal.NotifyContext(
+	// One signal context for the whole process. Each connection attempt gets a child context
+	// that the nsm0 watchdog cancels, which lets us tell "the datapath went away, reconnect
+	// now" apart from "we are shutting down".
+	rootCtx, stopSignals := signal.NotifyContext(
 		context.Background(),
 		os.Interrupt,
 		syscall.SIGHUP,
 		syscall.SIGTERM,
 		syscall.SIGQUIT,
 	)
+	defer stopSignals()
 
-	defer cancelParentSignalCtx()
-
-	for retry < retryLimit {
-		signalCtx, cancelSignalCtx := context.WithCancel(parentCtx)
-		defer cancelSignalCtx()
+	retry := 0
+	for rootCtx.Err() == nil {
+		signalCtx, cancelSignalCtx := context.WithCancel(rootCtx)
 		// Retry loop until connection succeeds
 		conn, err := getConnection(serverAddr)
 		if err != nil {
@@ -184,26 +187,19 @@ func main() {
 			InodeURL:       inodeUrl,
 			RetryCount:     int32(retry),
 		})
-		select {
-		case <-parentCtx.Done():
-			fmt.Println("Parent cancelled, exiting...")
-			cancelSignalCtx()
-			return
-
-		case <-signalCtx.Done():
-			fmt.Println("Signal done, waiting 1 minute (unless parent cancels)...")
-
-			for timer := 1; timer <= 60; timer++ {
-				select {
-				case <-parentCtx.Done():
-					fmt.Println("Parent cancelled, exiting...")
-					return
-				default:
-					time.Sleep(1 * time.Second)
-				}
-			}
-		}
 		cancelSignalCtx()
+		if rootCtx.Err() != nil {
+			// Shutting down: nothing to reconnect to.
+			return
+		}
+		// ProcessPod returned, so this pod currently has no NSM datapath -- either the
+		// watchdog saw nsm0 go away or the server released the connection. Waiting here is
+		// downtime, so retry promptly rather than sitting out a fixed delay.
+		select {
+		case <-rootCtx.Done():
+			return
+		case <-time.After(reconnectDelay):
+		}
 		retry++
 	}
 }
