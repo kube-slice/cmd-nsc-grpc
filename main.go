@@ -44,6 +44,17 @@ func getInodeURL() (string, error) {
 	return inodeURL, nil
 }
 
+// hasNSMInterface reports whether this pod has a usable NSM datapath.
+//
+// Interface presence alone is not enough. When the peer end of the connection dies -- an nsmgr
+// restart, a vl3 router restart, a heal that never completed -- the veth in this pod survives with
+// its address still configured while the router side is gone. The connection is then half open:
+// nothing routes, but a presence-only check is satisfied and never asks for a reconnect, so the pod
+// stays dead until something restarts it. A slice gateway left in that state strands the vl3
+// router with a nexthop it cannot resolve.
+//
+// Require the interface to be up and to still carry an address, which is what a live connection
+// looks like and what a torn-down one loses.
 func hasNSMInterface() bool {
 	ifaces, err := net.Interfaces()
 	if err != nil {
@@ -51,9 +62,29 @@ func hasNSMInterface() bool {
 	}
 
 	for _, iface := range ifaces {
-		if strings.HasPrefix(iface.Name, "nsm") {
+		if !strings.HasPrefix(iface.Name, "nsm") {
+			continue
+		}
+		if iface.Flags&net.FlagUp == 0 {
+			fmt.Printf("nsm interface %s is down\n", iface.Name)
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			fmt.Printf("cannot read addresses of %s: %v\n", iface.Name, err)
+			continue
+		}
+		for _, addr := range addrs {
+			ipNet, ok := addr.(*net.IPNet)
+			if !ok || ipNet.IP.To4() == nil {
+				continue
+			}
+			if ipNet.IP.IsUnspecified() || ipNet.IP.IsLoopback() {
+				continue
+			}
 			return true
 		}
+		fmt.Printf("nsm interface %s has no usable IPv4 address\n", iface.Name)
 	}
 	return false
 }
