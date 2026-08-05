@@ -7,10 +7,8 @@ import (
 	"github.com/vishvananda/netns"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
-	"net"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 )
@@ -21,13 +19,15 @@ func getInodeURL() (string, error) {
 		fmt.Printf("failed to get current pod netns: %v\n", err)
 		return "", err
 	}
-	defer podNS.Close()
 	pid := os.Getpid()
 
+	// os.NewFile takes ownership of the descriptor, so podNS must not be
+	// closed as well: closing it twice would, on the second call, close
+	// whatever descriptor number has been recycled in the meantime.
 	file := os.NewFile(uintptr(podNS), fmt.Sprintf("/proc/%d/ns/net", pid))
 	if file == nil {
-		fmt.Println("failed to create os.File from NsHandle")
-		return "", err
+		_ = podNS.Close()
+		return "", fmt.Errorf("cannot open the pod network namespace as a file")
 	}
 	defer file.Close()
 
@@ -42,68 +42,19 @@ func getInodeURL() (string, error) {
 	return inodeURL, nil
 }
 
-// hasNSMInterface reports whether this pod has a usable NSM datapath.
+// The pod no longer watches its own interface.
 //
-// Interface presence alone is not enough. When the peer end of the connection dies -- an nsmgr
-// restart, a vl3 router restart, a heal that never completed -- the veth in this pod survives with
-// its address still configured while the router side is gone. The connection is then half open:
-// nothing routes, but a presence-only check is satisfied and never asks for a reconnect, so the pod
-// stays dead until something restarts it. A slice gateway left in that state strands the vl3
-// router with a nexthop it cannot resolve.
+// It used to: a ticker checked every 10s that nsm0 was present with a usable
+// address, and cancelled the session when it was not, which made the broker
+// tear the connection down and build a new one. That cost a new address and
+// seconds of downtime for every transient break, and it could cancel a
+// connection that was still being set up -- the check was armed before the
+// request that creates the interface, so a setup slower than the interval was
+// killed and retried forever.
 //
-// Require the interface to be up and to still carry an address, which is what a live connection
-// looks like and what a torn-down one loses.
-func hasNSMInterface() bool {
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		return false
-	}
-
-	for _, iface := range ifaces {
-		if !strings.HasPrefix(iface.Name, "nsm") {
-			continue
-		}
-		if iface.Flags&net.FlagUp == 0 {
-			fmt.Printf("nsm interface %s is down\n", iface.Name)
-			continue
-		}
-		addrs, err := iface.Addrs()
-		if err != nil {
-			fmt.Printf("cannot read addresses of %s: %v\n", iface.Name, err)
-			continue
-		}
-		for _, addr := range addrs {
-			ipNet, ok := addr.(*net.IPNet)
-			if !ok || ipNet.IP.To4() == nil {
-				continue
-			}
-			if ipNet.IP.IsUnspecified() || ipNet.IP.IsLoopback() {
-				continue
-			}
-			return true
-		}
-		fmt.Printf("nsm interface %s has no usable IPv4 address\n", iface.Name)
-	}
-	return false
-}
-
-func checkNsmIpPresent(ctx context.Context, cancel context.CancelFunc) {
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if !hasNSMInterface() {
-				fmt.Println("nsm interface not present need to reconnect")
-				cancel()
-				return
-			}
-		}
-	}
-}
+// Repair belongs to the broker, which heals the connection in place. What is
+// left here is re-attachment: if the broker restarts, its heal state dies with
+// it, and only a new ProcessPod call can bring this pod back.
 
 func getConnection(serverAddr string) (*grpc.ClientConn, error) {
 	var conn *grpc.ClientConn
@@ -123,6 +74,19 @@ func getConnection(serverAddr string) (*grpc.ClientConn, error) {
 // reconnectDelay paces reconnect attempts. The pod is cut off from the slice until the next
 // attempt succeeds, so this is deliberately short.
 const reconnectDelay = time.Second
+
+// waitBeforeRetry paces reconnect attempts. It reports false when the process
+// is shutting down. Every failing path in the loop goes through it: without a
+// delay, a broker that is briefly unreachable turns every sidecar on the node
+// into a spin loop at exactly the moment the node is already struggling.
+func waitBeforeRetry(rootCtx context.Context) bool {
+	select {
+	case <-rootCtx.Done():
+		return false
+	case <-time.After(reconnectDelay):
+		return true
+	}
+}
 
 func main() {
 	serverAddr := "cmd-nsc-grpc-server.kubeslice-system.svc.cluster.local:50052"
@@ -158,8 +122,9 @@ func main() {
 		networkService := os.Getenv("NSM_NETWORK_SERVICES")
 		inodeUrl, err := getInodeURL()
 		if err != nil || inodeUrl == "" {
-			fmt.Println("failed to get inode URL")
+			fmt.Printf("failed to get inode URL: %v\n", err)
 			cancelSignalCtx()
+			waitBeforeRetry(rootCtx)
 			continue
 		}
 		resp, err := client.DiscoverServer(signalCtx, &nscpb.ClientNode{
@@ -168,17 +133,19 @@ func main() {
 		conn.Close()
 		if err != nil || resp.Server_Ip == "" {
 			fmt.Printf("failed to discover server: %v\n", err)
+			cancelSignalCtx()
+			waitBeforeRetry(rootCtx)
 			continue
 		}
 		fmt.Printf("discovered server: %s\n", resp.Server_Ip)
 		conn, err = getConnection(resp.Server_Ip)
-		defer conn.Close()
 		if err != nil {
 			fmt.Printf("failed to get connection: %v\n", err)
+			cancelSignalCtx()
+			waitBeforeRetry(rootCtx)
 			continue
 		}
 		client = nscpb.NewNSCServiceClient(conn)
-		go checkNsmIpPresent(signalCtx, cancelSignalCtx)
 		_, err = client.ProcessPod(signalCtx, &nscpb.PodRequest{
 			Name:           podName,
 			Namespace:      podNamespace,
@@ -188,17 +155,18 @@ func main() {
 			RetryCount:     int32(retry),
 		})
 		cancelSignalCtx()
+		// Closed here rather than deferred: main never returns, so a deferred
+		// close would hold every channel this loop has ever opened.
+		conn.Close()
 		if rootCtx.Err() != nil {
 			// Shutting down: nothing to reconnect to.
 			return
 		}
-		// ProcessPod returned, so this pod currently has no NSM datapath -- either the
-		// watchdog saw nsm0 go away or the server released the connection. Waiting here is
-		// downtime, so retry promptly rather than sitting out a fixed delay.
-		select {
-		case <-rootCtx.Done():
+		// ProcessPod returned, so the broker is no longer holding this pod's
+		// session -- it restarted, or it released the connection. Nothing else
+		// can bring the pod back, so ask again promptly.
+		if !waitBeforeRetry(rootCtx) {
 			return
-		case <-time.After(reconnectDelay):
 		}
 		retry++
 	}
