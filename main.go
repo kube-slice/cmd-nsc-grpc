@@ -7,15 +7,11 @@ import (
 	"github.com/vishvananda/netns"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
-	"net"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 )
-
-const retryLimit = 100
 
 func getInodeURL() (string, error) {
 	podNS, err := netns.Get()
@@ -23,13 +19,15 @@ func getInodeURL() (string, error) {
 		fmt.Printf("failed to get current pod netns: %v\n", err)
 		return "", err
 	}
-	defer podNS.Close()
 	pid := os.Getpid()
 
+	// os.NewFile takes ownership of the descriptor, so podNS must not be
+	// closed as well: closing it twice would, on the second call, close
+	// whatever descriptor number has been recycled in the meantime.
 	file := os.NewFile(uintptr(podNS), fmt.Sprintf("/proc/%d/ns/net", pid))
 	if file == nil {
-		fmt.Println("failed to create os.File from NsHandle")
-		return "", err
+		_ = podNS.Close()
+		return "", fmt.Errorf("cannot open the pod network namespace as a file")
 	}
 	defer file.Close()
 
@@ -44,37 +42,19 @@ func getInodeURL() (string, error) {
 	return inodeURL, nil
 }
 
-func hasNSMInterface() bool {
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		return false
-	}
-
-	for _, iface := range ifaces {
-		if strings.HasPrefix(iface.Name, "nsm") {
-			return true
-		}
-	}
-	return false
-}
-
-func checkNsmIpPresent(ctx context.Context, cancel context.CancelFunc) {
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if !hasNSMInterface() {
-				fmt.Println("nsm interface not present need to reconnect")
-				cancel()
-				return
-			}
-		}
-	}
-}
+// The pod no longer watches its own interface.
+//
+// It used to: a ticker checked every 10s that nsm0 was present with a usable
+// address, and cancelled the session when it was not, which made the broker
+// tear the connection down and build a new one. That cost a new address and
+// seconds of downtime for every transient break, and it could cancel a
+// connection that was still being set up -- the check was armed before the
+// request that creates the interface, so a setup slower than the interval was
+// killed and retried forever.
+//
+// Repair belongs to the broker, which heals the connection in place. What is
+// left here is re-attachment: if the broker restarts, its heal state dies with
+// it, and only a new ProcessPod call can bring this pod back.
 
 func getConnection(serverAddr string) (*grpc.ClientConn, error) {
 	var conn *grpc.ClientConn
@@ -91,27 +71,45 @@ func getConnection(serverAddr string) (*grpc.ClientConn, error) {
 	return conn, nil
 }
 
+// reconnectDelay paces reconnect attempts. The pod is cut off from the slice until the next
+// attempt succeeds, so this is deliberately short.
+const reconnectDelay = time.Second
+
+// waitBeforeRetry paces reconnect attempts. It reports false when the process
+// is shutting down. Every failing path in the loop goes through it: without a
+// delay, a broker that is briefly unreachable turns every sidecar on the node
+// into a spin loop at exactly the moment the node is already struggling.
+func waitBeforeRetry(rootCtx context.Context) bool {
+	select {
+	case <-rootCtx.Done():
+		return false
+	case <-time.After(reconnectDelay):
+		return true
+	}
+}
+
 func main() {
 	serverAddr := "cmd-nsc-grpc-server.kubeslice-system.svc.cluster.local:50052"
 	if os.Getenv("NSC_GRPC_SERVER_ADDR") != "" {
 		serverAddr = os.Getenv("NSC_GRPC_SERVER_ADDR")
 	}
 	fmt.Printf("NETNS_SERVER_ADDR=%s\n", serverAddr)
-	retry := 0
 
-	parentCtx, cancelParentSignalCtx := signal.NotifyContext(
+	// One signal context for the whole process. Each connection attempt gets a child context
+	// that the nsm0 watchdog cancels, which lets us tell "the datapath went away, reconnect
+	// now" apart from "we are shutting down".
+	rootCtx, stopSignals := signal.NotifyContext(
 		context.Background(),
 		os.Interrupt,
 		syscall.SIGHUP,
 		syscall.SIGTERM,
 		syscall.SIGQUIT,
 	)
+	defer stopSignals()
 
-	defer cancelParentSignalCtx()
-
-	for retry < retryLimit {
-		signalCtx, cancelSignalCtx := context.WithCancel(parentCtx)
-		defer cancelSignalCtx()
+	retry := 0
+	for rootCtx.Err() == nil {
+		signalCtx, cancelSignalCtx := context.WithCancel(rootCtx)
 		// Retry loop until connection succeeds
 		conn, err := getConnection(serverAddr)
 		if err != nil {
@@ -124,8 +122,9 @@ func main() {
 		networkService := os.Getenv("NSM_NETWORK_SERVICES")
 		inodeUrl, err := getInodeURL()
 		if err != nil || inodeUrl == "" {
-			fmt.Println("failed to get inode URL")
+			fmt.Printf("failed to get inode URL: %v\n", err)
 			cancelSignalCtx()
+			waitBeforeRetry(rootCtx)
 			continue
 		}
 		resp, err := client.DiscoverServer(signalCtx, &nscpb.ClientNode{
@@ -134,17 +133,19 @@ func main() {
 		conn.Close()
 		if err != nil || resp.Server_Ip == "" {
 			fmt.Printf("failed to discover server: %v\n", err)
+			cancelSignalCtx()
+			waitBeforeRetry(rootCtx)
 			continue
 		}
 		fmt.Printf("discovered server: %s\n", resp.Server_Ip)
 		conn, err = getConnection(resp.Server_Ip)
-		defer conn.Close()
 		if err != nil {
 			fmt.Printf("failed to get connection: %v\n", err)
+			cancelSignalCtx()
+			waitBeforeRetry(rootCtx)
 			continue
 		}
 		client = nscpb.NewNSCServiceClient(conn)
-		go checkNsmIpPresent(signalCtx, cancelSignalCtx)
 		_, err = client.ProcessPod(signalCtx, &nscpb.PodRequest{
 			Name:           podName,
 			Namespace:      podNamespace,
@@ -153,26 +154,20 @@ func main() {
 			InodeURL:       inodeUrl,
 			RetryCount:     int32(retry),
 		})
-		select {
-		case <-parentCtx.Done():
-			fmt.Println("Parent cancelled, exiting...")
-			cancelSignalCtx()
-			return
-
-		case <-signalCtx.Done():
-			fmt.Println("Signal done, waiting 1 minute (unless parent cancels)...")
-
-			for timer := 1; timer <= 60; timer++ {
-				select {
-				case <-parentCtx.Done():
-					fmt.Println("Parent cancelled, exiting...")
-					return
-				default:
-					time.Sleep(1 * time.Second)
-				}
-			}
-		}
 		cancelSignalCtx()
+		// Closed here rather than deferred: main never returns, so a deferred
+		// close would hold every channel this loop has ever opened.
+		conn.Close()
+		if rootCtx.Err() != nil {
+			// Shutting down: nothing to reconnect to.
+			return
+		}
+		// ProcessPod returned, so the broker is no longer holding this pod's
+		// session -- it restarted, or it released the connection. Nothing else
+		// can bring the pod back, so ask again promptly.
+		if !waitBeforeRetry(rootCtx) {
+			return
+		}
 		retry++
 	}
 }
